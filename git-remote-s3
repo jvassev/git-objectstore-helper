@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o pipefail
+set -o nounset
+
+
+if [[ "${GIT_OBJECTSTORE_LOG:-}" != '' ]]; then
+    set -x
+fi
+
+log() {
+    ( >&2 echo "$@" )
+}
+
+init() {
+    log "git-remote-s3 called with: $*"
+    if [[ "$1" = "s3::$2" ]]; then
+        alias=_
+    else
+        alias="$1"
+    fi
+
+    # s3 url wothout trailing slash
+    url="$2"
+    url="${url%%/}"
+
+    dir="${GIT_DIR}/s3/${alias}"
+    prefix="refs/s3/${alias}"
+    mkdir -p "${dir}"
+    marksfile="${GIT_DIR}/s3/${alias}.gitmarks"
+    touch "${marksfile}"
+
+    refspec="refs/heads/*:${prefix}/heads/*"
+
+    bucket=${url##s3://}
+    bucket=${bucket%%/*}
+
+    path=${url##s3://}
+    path=${path#*/}
+
+    if [[ "${GIT_OBJECTSTORE_ENDPOINT:-}" != '' ]]; then
+        # only for minio
+        AWS_CLI_PARAMS="--endpoint-url ${GIT_OBJECTSTORE_ENDPOINT}"
+    else
+        AWS_CLI_PARAMS=''
+    fi
+
+    if ! is_repo_root; then
+        log "The s3 path ${url} is not a repo root"
+        exit 1
+    fi
+}
+
+do_list() {
+    local t="$(mktemp)"
+    local rc=0
+
+    # fetch only the packed-refs from remote; if not found probably remote repo is bad
+    aws s3 ${AWS_CLI_PARAMS} cp "${url}/packed-refs" "$t" >&2 || rc=$?
+    if [[ $rc == 0 ]]; then
+        grep -v '^#' < "$t" | sed 's/^.* /\? /' || true
+    fi
+
+    # fetch the default branch
+    rc=0
+    aws s3 ${AWS_CLI_PARAMS} cp "${url}/HEAD" "$t" >&2 || rc=$?
+    if [[ $rc == 0 ]]; then
+        sed 's/ref: /@/'  < "$t" | sed 's/$/ HEAD/'
+    fi
+
+    # clenup
+    rm -f "$t"
+    echo
+}
+
+do_caps() {
+    echo 'import'
+    echo 'export'
+    echo "refspec ${refspec}"
+    echo 'signed-tags'
+    # important empty new line here
+    echo
+}
+
+check_awscli_config() {
+    # todo validate aws config works
+    return 0
+}
+
+is_repo_root() {
+    if aws s3 ${AWS_CLI_PARAMS} ls "${url}/" &> /dev/null; then
+        # empty folder
+        return 0
+    fi
+
+    if aws s3 ${AWS_CLI_PARAMS} ls "${url}/packed-refs" &> /dev/null; then
+        # marker file is found
+        return 0
+    fi
+
+    return 1
+}
+
+do_opts() {
+    local cmd="${1}"
+    local opt="${2}"
+    local val="${3}"
+
+    log "Ignored opt: cmd=${cmd} opt=${opt} val=${val}"
+    # TODO handle opts??
+}
+
+do_import() {
+    local refs="$1"
+
+    # sync from bycket
+    aws s3 ${AWS_CLI_PARAMS} sync --delete "${url}" "${dir}" >&2
+    # create marker dirs just in case
+    mkdir -p "${dir}/branches" "${dir}/refs"
+
+    # this is fragile. what if the commits data/msg contains those strings??
+    GIT_DIR="${dir}" git fast-export --import-marks="${marksfile}" --export-marks="${marksfile}" ${refs} |
+    sed -e "s#^commit refs/heads/#commit ${prefix}/heads/#g" |
+    sed -e "s#^reset refs/heads/#reset ${prefix}/heads/#g"
+
+    echo "done"
+}
+
+
+do_export() {
+    local ref a before
+
+    # init bare repo
+    git init --bare "${dir}" > /dev/null || true
+    rm -fr "${dir}/hooks"
+    mkdir -p "${dir}/branches" "${dir}/refs"
+
+    # push to the hidden bare repo
+    git push --all --atomic --prune --force "${dir}"
+    GIT_DIR="${dir}" git gc
+
+    # sync hidden bare repo to bucket
+    aws s3 ${AWS_CLI_PARAMS} sync --delete "${dir}" "${url}" >&2
+
+    # implement git-import protocol
+    before=$(GIT_DIR="${dir}" git for-each-ref --format=' %(refname) %(objectname) ')
+    GIT_DIR="${dir}" git fast-import --import-marks="${marksfile}" --export-marks="${marksfile}" --force --quiet
+
+    # figure out which refs were updated
+    GIT_DIR="${dir}" git for-each-ref --format='%(refname) %(objectname)' |
+    while read ref a; do
+        case "${before}" in
+            *" ${ref} $a "*)
+            continue ;;	# unchanged
+        esac
+
+        echo "ok ${ref}"
+    done
+
+    echo
+}
+
+main() {
+    local cmd val opt line
+    local ref refs=''
+    while read line; do
+        case $line in
+            capabilities)
+                do_caps
+            ;;
+            list)
+                do_list
+            ;;
+            import*)
+                while true; do
+                    ref="${line#* }"
+                    refs="$refs $ref"
+                    read line
+                    [[ "${line%% *}" != "import" ]] && break
+                done
+                echo "feature done"
+                do_import "${refs}"
+            ;;
+            export)
+                do_export
+            ;;
+            option\ *)
+            read cmd opt val <<-EOF
+            $line
+EOF
+                do_opt "${cmd}" "${opt}" "${val}"
+            ;;
+            '')
+                exit 0
+            ;;
+        esac
+    done
+}
+
+init "$@"
+
+main
