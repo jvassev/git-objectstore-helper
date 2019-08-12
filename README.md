@@ -23,7 +23,7 @@ Add a remote to your local clone:
 git remote add my-bucket s3://test123/my/repo
 ```
 
-Push the that remote:
+Push to that remote:
 
 ```
 git push my-bucket master
