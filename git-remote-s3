@@ -89,7 +89,7 @@ check_awscli_config() {
 }
 
 is_repo_root() {
-    if aws s3 ${AWS_CLI_PARAMS} ls "${url}/" &> /dev/null; then
+    if ! aws s3 ${AWS_CLI_PARAMS} ls "${url}/" &> /dev/null; then
         # empty folder
         return 0
     fi
